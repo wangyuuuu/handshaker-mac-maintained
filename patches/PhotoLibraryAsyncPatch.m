@@ -8,6 +8,12 @@
 #import <signal.h>
 #import <stdint.h>
 #import <string.h>
+#import <errno.h>
+#import <sys/fcntl.h>
+#import <sys/poll.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
 
 typedef void (*HSParserIMP)(id, SEL, id);
 typedef void (*HSReloadIMP)(id, SEL, BOOL, id);
@@ -24,6 +30,10 @@ typedef BOOL (*HSBoolNoArgumentIMP)(id, SEL);
 typedef BOOL (*HSBoolObjectIMP)(id, SEL, id);
 typedef long long (*HSLongLongNoArgumentIMP)(id, SEL);
 typedef id (*HSObjectObjectIMP)(id, SEL, id);
+typedef id (*HSIdMsgSendNoArguments)(id, SEL);
+typedef void (*HSObjectObjectMsgSend)(id, SEL, id, id);
+typedef BOOL (*HSBoolObjectObjectIMP)(id, SEL, id, id);
+typedef BOOL (*HSWifiConnectIMP)(id, SEL, id, NSError *__autoreleasing *);
 
 struct HSLibusbVersion {
     uint16_t major;
@@ -79,6 +89,9 @@ static HSVMsgSend HSOriginalSyncConfigOpenWindow = NULL;
 static HSInitMsgSend HSOriginalVideoAllowedFileTypes = NULL;
 static HSQRCodeImageIMP HSOriginalQRCodeImage = NULL;
 static HSBoolObjectIMP HSOriginalIsSupportedVideoExt = NULL;
+static HSBoolObjectObjectIMP HSOriginalWifiConnect = NULL;
+static HSWifiConnectIMP HSOriginalWifiConnectTyped = NULL;
+static HSIdMsgSendNoArguments HSOriginalCallStackSymbols = NULL;
 static __weak id HSLastPhotoViewController = nil;
 static char HSPreparedPhotoImageKey;
 static char HSPhotoLoadingOverlayKey;
@@ -113,6 +126,8 @@ static BOOL HSSwizzledPhotoSyncPromptDiagnostics = NO;
 static BOOL HSSwizzledVideoAllowedFileTypes = NO;
 static BOOL HSSwizzledSupportedVideoExt = NO;
 static BOOL HSSwizzledQRCodeImage = NO;
+static BOOL HSSwizzledWifiConnect = NO;
+static BOOL HSSwizzledCallStackThrottle = NO;
 static BOOL HSRegisteredLegacyPromptDefaults = NO;
 static BOOL HSLoggedInstall = NO;
 static BOOL HSDiagnosticsLogged = NO;
@@ -125,6 +140,7 @@ static const unsigned long long HSPhotoCacheLowDiskFreeBytes = 10ULL * 1024ULL *
 static const unsigned long long HSUSBDiagnosticMaxBytes = 8ULL * 1024ULL * 1024ULL;
 extern void HSInstallUSBTransportDiagnostics(void);
 static const int HSUSBHandshakeTimeoutMilliseconds = 15000;
+static const int HSWifiConnectProbeTimeoutMilliseconds = 4000;
 static NSString *const HSLegacyAndroidDownloadURL = @"http://t.tt/apps/handshaker?qr=1";
 static NSString *const HSAndroidReleaseURL = @"https://github.com/rianlu/handshaker-android-maintained/releases/latest";
 
@@ -1352,6 +1368,152 @@ static id HSQRCodeImage(id self, SEL _cmd, id value, CGFloat size) {
     return HSOriginalQRCodeImage ? HSOriginalQRCodeImage(self, _cmd, resolvedValue, size) : nil;
 }
 
+#pragma mark - Wi-Fi connect probe + callstack throttle
+
+// Rosetta 2 下 +[NSThread callStackSymbols] (backtrace_symbols -> dladdr 符号查找) 单次调用
+// 可能耗时数百毫秒. 无线连接失败路径上 SFLogger 每条 error 日志都抓一次调用栈,
+// probe 重试风暴时主线程也会因等 __SFLogger_mutex__ 而彩球卡死.
+// 这里按线程节流: 1 秒窗口内重复调用直接返回空栈, 单次调用不受影响.
+static NSTimeInterval HSCallStackThrottleInterval = 1.0;
+
+static id HSThrottledCallStackSymbols(id self, SEL _cmd) {
+    @try {
+        NSMutableDictionary *threadDictionary = [[NSThread currentThread] threadDictionary];
+        NSNumber *lastSample = threadDictionary[@"HSLastCallStackSampleTime"];
+        NSTimeInterval now = [NSDate date].timeIntervalSinceReferenceDate;
+        if (lastSample && now - lastSample.doubleValue < HSCallStackThrottleInterval) {
+            return @[];
+        }
+        threadDictionary[@"HSLastCallStackSampleTime"] = @(now);
+    } @catch (__unused NSException *exception) {
+    }
+    return HSOriginalCallStackSymbols ? HSOriginalCallStackSymbols(self, _cmd) : @[];
+}
+
+static void HSInstallThreadCallStackThrottle(void) {
+    if (HSSwizzledCallStackThrottle) {
+        return;
+    }
+
+    HSSwizzledCallStackThrottle = HSSwizzleInstanceMethodOnce(object_getClass([NSThread class]),
+                                                              NSSelectorFromString(@"callStackSymbols"),
+                                                              (IMP)HSThrottledCallStackSymbols,
+                                                              (IMP *)&HSOriginalCallStackSymbols);
+    if (HSSwizzledCallStackThrottle) {
+        NSLog(@"[HandShakerMaintained] callStackSymbols throttle installed (%.2fs window)", HSCallStackThrottleInterval);
+    }
+}
+
+// 用非阻塞 connect + poll 以短超时探测地址可达性.
+// 原版 -[SFWifiSocket connectToAddress:error:] 使用阻塞 connect 且无任何超时,
+// 手机休眠/离网后 mDNS 缓存地址不可达, connect 可挂起 75 秒, probe 重试导致线程堆积.
+static BOOL HSWifiProbeAddressReachable(NSData *addressData, NSString **failureReason) {
+    if (!addressData || addressData.length < sizeof(struct sockaddr_in)) {
+        if (failureReason) {
+            *failureReason = @"address-data-invalid";
+        }
+        return NO;
+    }
+
+    const struct sockaddr *genericAddress = (const struct sockaddr *)addressData.bytes;
+    if (genericAddress->sa_family != AF_INET) {
+        if (failureReason) {
+            *failureReason = [NSString stringWithFormat:@"unsupported-family-%d", genericAddress->sa_family];
+        }
+        return NO;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        if (failureReason) {
+            *failureReason = [NSString stringWithFormat:@"socket-errno-%d", errno];
+        }
+        return NO;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0 && !(flags & O_NONBLOCK)) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    struct sockaddr storage;
+    memcpy(&storage, addressData.bytes, MIN(addressData.length, sizeof(storage)));
+    int connectResult = connect(fd, (const struct sockaddr *)&storage, (socklen_t)genericAddress->sa_len);
+    BOOL reachable = NO;
+    if (connectResult == 0) {
+        reachable = YES;
+    } else if (errno == EINPROGRESS) {
+        struct pollfd descriptor = {.fd = fd, .events = POLLOUT, .revents = 0};
+        int pollResult = poll(&descriptor, 1, HSWifiConnectProbeTimeoutMilliseconds);
+        if (pollResult > 0) {
+            int pendingError = 0;
+            socklen_t pendingErrorLength = sizeof(pendingError);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &pendingError, &pendingErrorLength) == 0 && pendingError == 0) {
+                reachable = YES;
+            } else if (failureReason) {
+                *failureReason = [NSString stringWithFormat:@"connect-soerror-%d", pendingError];
+            }
+        } else if (pollResult == 0 && failureReason) {
+            *failureReason = [NSString stringWithFormat:@"connect-timeout-%dms", HSWifiConnectProbeTimeoutMilliseconds];
+        } else if (failureReason) {
+            *failureReason = [NSString stringWithFormat:@"poll-errno-%d", errno];
+        }
+    } else if (failureReason) {
+        *failureReason = [NSString stringWithFormat:@"connect-errno-%d", errno];
+    }
+
+    close(fd);
+    return reachable;
+}
+
+static BOOL HSWifiConnectToAddress(id self, SEL _cmd, id address, NSError **error) {
+    NSData *addressData = [address isKindOfClass:[NSData class]] ? address : nil;
+    if (addressData) {
+        NSString *failureReason = nil;
+        if (!HSWifiProbeAddressReachable(addressData, &failureReason)) {
+            NSLog(@"[HandShakerMaintained] Wi-Fi connect probe failed quickly (%@), skipping blocking connect",
+                  failureReason ?: @"unknown");
+            NSError *payload = [NSError errorWithDomain:@"SFWifiSocketMaintained"
+                                                   code:-2
+                                               userInfo:@{NSLocalizedDescriptionKey : @"maintained probe: address unreachable"}];
+            if (error) {
+                *error = payload;
+            }
+
+            id delegate = HSValueForKey(self, @"delegate");
+            SEL disconnectSelector = NSSelectorFromString(@"sfsocketDidDisconnect:withError:");
+            if (delegate && [delegate respondsToSelector:disconnectSelector]) {
+                ((HSObjectObjectMsgSend)objc_msgSend)(delegate, disconnectSelector, self, payload);
+            }
+            return NO;
+        }
+    }
+
+    // 探测通过(或地址类型未知): 交还原实现, 此刻 connect 立即完成, 不会再挂起.
+    return HSOriginalWifiConnectTyped ? HSOriginalWifiConnectTyped(self, _cmd, address, error) : NO;
+}
+
+static void HSInstallWifiSocketPatch(void) {
+    if (HSSwizzledWifiConnect) {
+        return;
+    }
+
+    Class socketClass = NSClassFromString(@"SFWifiSocket");
+    if (!socketClass) {
+        return;
+    }
+
+    HSSwizzledWifiConnect = HSSwizzleInstanceMethodOnce(socketClass,
+                                                        NSSelectorFromString(@"connectToAddress:error:"),
+                                                        (IMP)HSWifiConnectToAddress,
+                                                        (IMP *)&HSOriginalWifiConnect);
+    HSOriginalWifiConnectTyped = (HSWifiConnectIMP)HSOriginalWifiConnect;
+    if (HSSwizzledWifiConnect) {
+        NSLog(@"[HandShakerMaintained] Wi-Fi connect probe patch installed (timeout %dms)",
+              HSWifiConnectProbeTimeoutMilliseconds);
+    }
+}
+
 static void HSInstallAndroidReleaseURLPatch(void) {
     if (HSSwizzledQRCodeImage) {
         return;
@@ -1582,6 +1744,8 @@ static void HSPhotoLibraryAsyncPatchEntry(void) {
     HSInstallUSBTransportDiagnostics();
     HSInstallDeviceManagerPatch();
     HSInstallPhotoSyncPromptDiagnostics();
+    HSInstallWifiSocketPatch();
+    HSInstallThreadCallStackThrottle();
 
     dispatch_async(dispatch_get_main_queue(), ^{
         HSInstallLegacyReporterGuards(YES);
@@ -1590,6 +1754,8 @@ static void HSPhotoLibraryAsyncPatchEntry(void) {
         HSInstallVideoFormatPatch();
         HSInstallAndroidReleaseURLPatch();
         HSInstallPhotoLibraryAsyncPatch();
+        HSInstallWifiSocketPatch();
+        HSInstallThreadCallStackThrottle();
         HSScheduleLegacyReporterTeardown();
 
         [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidFinishLaunchingNotification
@@ -1602,6 +1768,8 @@ static void HSPhotoLibraryAsyncPatchEntry(void) {
             HSInstallVideoFormatPatch();
             HSInstallAndroidReleaseURLPatch();
             HSInstallPhotoLibraryAsyncPatch();
+            HSInstallWifiSocketPatch();
+            HSInstallThreadCallStackThrottle();
         }];
     });
 }
