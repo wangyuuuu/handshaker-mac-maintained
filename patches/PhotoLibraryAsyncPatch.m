@@ -34,6 +34,9 @@ typedef id (*HSIdMsgSendNoArguments)(id, SEL);
 typedef void (*HSObjectObjectMsgSend)(id, SEL, id, id);
 typedef BOOL (*HSBoolObjectObjectIMP)(id, SEL, id, id);
 typedef BOOL (*HSWifiConnectIMP)(id, SEL, id, NSError *__autoreleasing *);
+typedef void (*HSOneObjectMsgSend)(id, SEL, id);
+typedef void (*HSTwoObjectMsgSend)(id, SEL, id, id);
+typedef void (*HSTwoObjectBoolMsgSend)(id, SEL, id, id, BOOL);
 
 struct HSLibusbVersion {
     uint16_t major;
@@ -220,6 +223,7 @@ static NSString *HSPhotoThumbnailCachePath(void) {
 }
 
 static void HSLogPhotoSyncPrompt(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void HSLogWifi(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
 static void HSLogPhotoSyncPrompt(NSString *format, ...) {
     va_list arguments;
@@ -1362,6 +1366,10 @@ static void HSInstallVideoFormatPatch(void) {
 }
 
 static id HSQRCodeImage(id self, SEL _cmd, id value, CGFloat size) {
+    // 记录二维码原始载荷: 无线配对码里含本机 IP/端口/令牌, IP 选错(如 Clash utun 假 IP)会导致扫码必失败.
+    if ([value isKindOfClass:[NSString class]]) {
+        HSLogWifi(@"QR payload (%lu chars): %@", (unsigned long)[value length], value);
+    }
     id resolvedValue = [value isKindOfClass:[NSString class]] && [value isEqualToString:HSLegacyAndroidDownloadURL]
         ? HSAndroidReleaseURL
         : value;
@@ -1471,8 +1479,7 @@ static BOOL HSWifiConnectToAddress(id self, SEL _cmd, id address, NSError **erro
     if (addressData) {
         NSString *failureReason = nil;
         if (!HSWifiProbeAddressReachable(addressData, &failureReason)) {
-            NSLog(@"[HandShakerMaintained] Wi-Fi connect probe failed quickly (%@), skipping blocking connect",
-                  failureReason ?: @"unknown");
+            HSLogWifi(@"connect probe failed quickly (%@), skipping blocking connect", failureReason ?: @"unknown");
             NSError *payload = [NSError errorWithDomain:@"SFWifiSocketMaintained"
                                                    code:-2
                                                userInfo:@{NSLocalizedDescriptionKey : @"maintained probe: address unreachable"}];
@@ -1511,6 +1518,129 @@ static void HSInstallWifiSocketPatch(void) {
     if (HSSwizzledWifiConnect) {
         NSLog(@"[HandShakerMaintained] Wi-Fi connect probe patch installed (timeout %dms)",
               HSWifiConnectProbeTimeoutMilliseconds);
+    }
+}
+
+#pragma mark - Wi-Fi discovery diagnostics
+
+// WiFi 诊断日志同时落盘, 便于直接读取诊断(不依赖 unified log).
+static void HSLogWifi(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+
+static void HSLogWifi(NSString *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+
+    NSLog(@"[HandShakerMaintained] [WiFi] %@", message);
+
+    NSString *logDirectory = [HSHandShakerApplicationSupportPath() stringByAppendingPathComponent:@"logs"];
+    NSString *logPath = [logDirectory stringByAppendingPathComponent:@"wifi-maintained.log"];
+    if (!logPath.length) {
+        return;
+    }
+
+    @synchronized([NSFileHandle class]) {
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        [fileManager createDirectoryAtPath:logDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message];
+        NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (!file) {
+            [fileManager createFileAtPath:logPath contents:[line dataUsingEncoding:NSUTF8StringEncoding] attributes:nil];
+        } else {
+            @try {
+                [file seekToEndOfFile];
+                [file writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            } @catch (__unused NSException *exception) {
+            }
+            [file closeFile];
+        }
+    }
+}
+
+// 无线发现链路诊断: 浏览启动失败(didNotSearch 带 error)通常意味着本地网络权限被拒,
+// 发现服务/解析地址日志用于确认 Bonjour 是否真的把手机报上来.
+static IMP HSOriginalNetServiceWillSearch = NULL;
+static IMP HSOriginalNetServiceDidNotSearch = NULL;
+static IMP HSOriginalNetServiceDidFindService = NULL;
+static IMP HSOriginalNetServiceDidResolveAddress = NULL;
+static BOOL HSSwizzledWifiDiscoveryDiagnostics = NO;
+
+static void HSNetServiceWillSearch(id self, SEL _cmd, id browser) {
+    HSLogWifi(@"browse starting");
+    if (HSOriginalNetServiceWillSearch) {
+        ((HSOneObjectMsgSend)HSOriginalNetServiceWillSearch)(self, _cmd, browser);
+    }
+}
+
+static void HSNetServiceDidNotSearch(id self, SEL _cmd, id browser, id errorDict) {
+    HSLogWifi(@"browse FAILED error=%@", errorDict);
+    if (HSOriginalNetServiceDidNotSearch) {
+        ((HSTwoObjectMsgSend)HSOriginalNetServiceDidNotSearch)(self, _cmd, browser, errorDict);
+    }
+}
+
+static void HSNetServiceDidFindService(id self, SEL _cmd, id browser, id service, BOOL moreComing) {
+    id name = HSValueForKey(service, @"name");
+    id type = HSValueForKey(service, @"type");
+    id domain = HSValueForKey(service, @"domain");
+    HSLogWifi(@"found service name=%@ type=%@ domain=%@ more=%d", name, type, domain, moreComing);
+    if (HSOriginalNetServiceDidFindService) {
+        ((HSTwoObjectBoolMsgSend)HSOriginalNetServiceDidFindService)(self, _cmd, browser, service, moreComing);
+    }
+}
+
+static void HSNetServiceDidResolveAddress(id self, SEL _cmd, id service) {
+    NSArray *addresses = HSValueForKey(service, @"addresses");
+    NSMutableArray *descriptions = [NSMutableArray array];
+    for (NSData *addressData in [addresses isKindOfClass:[NSArray class]] ? addresses : @[]) {
+        if (![addressData isKindOfClass:[NSData class]] || addressData.length < sizeof(struct sockaddr_in)) {
+            continue;
+        }
+        const struct sockaddr_in *address = (const struct sockaddr_in *)addressData.bytes;
+        if (address->sin_family != AF_INET) {
+            continue;
+        }
+        char host[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &address->sin_addr, host, sizeof(host));
+        [descriptions addObject:[NSString stringWithFormat:@"%s:%d", host, ntohs(address->sin_port)]];
+    }
+    HSLogWifi(@"resolved service name=%@ port=%ld addresses=%@", HSValueForKey(service, @"name"), (long)[HSValueForKey(service, @"port") longValue], descriptions.count ? [descriptions componentsJoinedByString:@","] : @"<none>");
+    if (HSOriginalNetServiceDidResolveAddress) {
+        ((HSOneObjectMsgSend)HSOriginalNetServiceDidResolveAddress)(self, _cmd, service);
+    }
+}
+
+static void HSInstallWifiDiscoveryDiagnostics(void) {
+    if (HSSwizzledWifiDiscoveryDiagnostics) {
+        return;
+    }
+
+    Class managerClass = NSClassFromString(@"SFWifiDeviceManager");
+    if (!managerClass) {
+        return;
+    }
+
+    BOOL installed = YES;
+    installed = HSSwizzleInstanceMethodOnce(managerClass,
+                                            NSSelectorFromString(@"netServiceBrowserWillSearch:"),
+                                            (IMP)HSNetServiceWillSearch,
+                                            &HSOriginalNetServiceWillSearch) && installed;
+    installed = HSSwizzleInstanceMethodOnce(managerClass,
+                                            NSSelectorFromString(@"netServiceBrowser:didNotSearch:"),
+                                            (IMP)HSNetServiceDidNotSearch,
+                                            &HSOriginalNetServiceDidNotSearch) && installed;
+    installed = HSSwizzleInstanceMethodOnce(managerClass,
+                                            NSSelectorFromString(@"netServiceBrowser:didFindService:moreComing:"),
+                                            (IMP)HSNetServiceDidFindService,
+                                            &HSOriginalNetServiceDidFindService) && installed;
+    installed = HSSwizzleInstanceMethodOnce(managerClass,
+                                            NSSelectorFromString(@"netServiceDidResolveAddress:"),
+                                            (IMP)HSNetServiceDidResolveAddress,
+                                            &HSOriginalNetServiceDidResolveAddress) && installed;
+    HSSwizzledWifiDiscoveryDiagnostics = installed;
+    if (installed) {
+        NSLog(@"[HandShakerMaintained] Wi-Fi discovery diagnostics installed");
     }
 }
 
@@ -1746,6 +1876,7 @@ static void HSPhotoLibraryAsyncPatchEntry(void) {
     HSInstallPhotoSyncPromptDiagnostics();
     HSInstallWifiSocketPatch();
     HSInstallThreadCallStackThrottle();
+    HSInstallWifiDiscoveryDiagnostics();
 
     dispatch_async(dispatch_get_main_queue(), ^{
         HSInstallLegacyReporterGuards(YES);
@@ -1756,6 +1887,7 @@ static void HSPhotoLibraryAsyncPatchEntry(void) {
         HSInstallPhotoLibraryAsyncPatch();
         HSInstallWifiSocketPatch();
         HSInstallThreadCallStackThrottle();
+        HSInstallWifiDiscoveryDiagnostics();
         HSScheduleLegacyReporterTeardown();
 
         [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidFinishLaunchingNotification
@@ -1770,6 +1902,7 @@ static void HSPhotoLibraryAsyncPatchEntry(void) {
             HSInstallPhotoLibraryAsyncPatch();
             HSInstallWifiSocketPatch();
             HSInstallThreadCallStackThrottle();
+            HSInstallWifiDiscoveryDiagnostics();
         }];
     });
 }
